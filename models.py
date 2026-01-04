@@ -72,7 +72,7 @@ class Ads(Base):
             'id': self.id,
             'title': self.title,
             'description': self.description,
-            'user': self.user
+            'user_id': self.user_id
         }
 
 async def init_orm():
