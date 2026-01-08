@@ -1,22 +1,12 @@
 import json
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy import select
 from aiohttp import web
+from jwt_auth import verify_jwt_token, create_jwt_token
 from models import init_orm, close_orm, DbSession, User, Ads
-from cryptography import fernet
-from aiohttp_session.cookie_storage import EncryptedCookieStorage
-from aiohttp_session import setup, get_session
-import base64
 
-
-def generate_secret_key():
-    return fernet.Fernet.generate_key()
-
-def setup_sessions(app: web.Application):
-    secret_key = base64.urlsafe_b64decode(generate_secret_key())
-    storage = EncryptedCookieStorage(secret_key)
-    setup(app, storage)
 
 def get_error(msg: str | list | dict, cls):
     msg = {"error": msg}
@@ -26,6 +16,7 @@ def get_error(msg: str | list | dict, cls):
         content_type="application/json",
     )
 
+
 async def add_user(session: AsyncSession, user: User):
     session.add(user)
     try:
@@ -33,13 +24,14 @@ async def add_user(session: AsyncSession, user: User):
     except IntegrityError:
         raise get_error("User already exists", web.HTTPConflict)
 
+
 async def orm_context(app: web.Application):
     print('STARS')
-    # await drop_db()
     await init_orm()
     yield
     await close_orm()
     print('FINISH')
+
 
 @web.middleware
 async def session_middleware(request: web.Request, handler):
@@ -48,58 +40,102 @@ async def session_middleware(request: web.Request, handler):
         response = await handler(request)
         return response
 
+
 @web.middleware
-async def auth_middleware(request: web.Request, handler):
-    if request.path == '/login/' or request.path == '/users/' and request.method == 'POST':
-        return await handler(request)
+async def jwt_auth_middleware(request: web.Request, handler):
+    public_paths = [
+        ('/login/', 'POST', False),
+        ('/users/', 'POST', False),
+        ('/ads/', 'GET', True)
+    ]
+    current_path = request.path
+    current_method = request.method.upper()
+    for path, method, allow_subpaths in public_paths:
+        if current_method == method:
+            if allow_subpaths and current_path.startswith(path):
+                return await handler(request)
+            elif not allow_subpaths and current_path == path:
+                return await handler(request)
 
-    if request.path.startswith('/ads/') and request.method == 'GET':
-        return await handler(request)
+    auth_header = request.headers.get('Authorization')
 
-    session = await get_session(request)
-    user_id = session.get('user_id')
+    if not auth_header:
+        raise web.HTTPUnauthorized(text=json.dumps({'error': 'Authorization header is missing'}), content_type='application/json')
 
+    parts = auth_header.split()
+    if len(parts) != 2 or parts[0].lower() != 'bearer':
+        raise web.HTTPUnauthorized(text=json.dumps({'error': 'Invalid Authorization header format. Expected: Bearer <token>'}), content_type='application/json')
+
+    token = parts[1]
+    payload = verify_jwt_token(token)
+    if not payload:
+        raise web.HTTPUnauthorized(text=json.dumps({'error': 'Invalid or expired token'}), content_type='application/json')
+
+    payload = verify_jwt_token(token)
+    user_id = payload.get('user_id') or payload.get('id') or payload.get('sub')
     if not user_id:
-        raise web.HTTPUnauthorized(text=json.dumps({"error": "Unauthorized"}), content_type="application/json")
+        raise web.HTTPUnauthorized(text=json.dumps({'error': 'Token does not contain user identifier'}), content_type='application/json')
 
     async with DbSession() as session:
         user = await session.get(User, user_id)
         if not user:
-            raise web.HTTPUnauthorized(text=json.dumps({"error": "User not found"}), content_type="application/json")
+            raise web.HTTPUnauthorized(text=json.dumps({'error': 'User not found'}), content_type='application/json')
+
+        if hasattr(user, 'is_active') and not user.is_active:
+            raise web.HTTPUnauthorized(text=json.dumps({'error': 'User account is deactivated'}), content_type='application/json')
         request.user = user
+        request.jwt_payload = payload
+
     return await handler(request)
 
+
 app = web.Application()
-setup_sessions(app)
 app.cleanup_ctx.append(orm_context)
 app.middlewares.append(session_middleware)
-app.middlewares.append(auth_middleware)
+app.middlewares.append(jwt_auth_middleware)
 
-class SessionView(web.View):
+
+class JWTAuthView(web.View):
     async def post(self):
-        data = await self.request.json()
-        email = data.get('email')
-        password = data.get('password')
+        try:
+            data = await self.request.json()
+            email = data.get('email')
+            password = data.get('password')
 
-        if not email or not password:
-            raise get_error("Email and password required", web.HTTPBadRequest)
+            if not email or not password:
+                raise get_error("Email and password required", web.HTTPBadRequest)
 
-        stmt = select(User).where(User.email == email)
-        result = await self.request.session.execute(stmt)
-        user = result.scalar_one_or_none()
+            session = self.request.session
+            stmt = select(User).where(User.email == email)
+            result = await session.execute(stmt)
+            user = result.scalar_one_or_none()
+            if not user or not await user.check_password(password):
+                raise web.HTTPUnauthorized(text=json.dumps({'error': 'Invalid credentials'}), content_type='application/json')
 
-        if not user or  not user.check_password(password):
-            raise get_error("Invalid credentials", web.HTTPUnauthorized)
+            token = create_jwt_token({
+                'id': user.id,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name
+            })
+            response_data = {
+                'msg': 'Login successful',
+                'token': token,
+                'user': {
+                    'id': user.id,
+                    'email': user.email,
+                    'first_name': user.first_name,
+                    'last_name': user.last_name
+                }
+            }
+            response = web.json_response(response_data)
+            return response
 
-        session = await get_session(self.request)
-        session['user_id'] = user.id
+        except json.JSONDecodeError:
+            raise web.HTTPBadRequest(text=json.dumps({'error': 'Invalid JSON'}), content_type='application/json')
 
-        return web.json_response({"message": "Login successful", "user": user.dict})
-
-    async def delete(self):
-        session = await get_session(self.request)
-        session.pop('user_id', None)
-        return web.json_response({"message": "Logged out"})
+        except Exception as e:
+            return web.HTTPInternalServerError(text=json.dumps({'error': f'Server error: {str(e)}'}), content_type='application/json')
 
 
 class UserView(web.View):
@@ -129,12 +165,19 @@ class UserView(web.View):
         user_json = await self.request.json()
         if "password" not in user_json:
             raise get_error("Password is required", web.HTTPBadRequest)
+
+        if 'last_name' or 'first_name' not in user_json:
+            raise get_error('name is required', web.HTTPBadRequest)
+
+        if 'email' not in user_json:
+            raise get_error('email is required', web.HTTPBadRequest)
+
         user = User(
             first_name=user_json["first_name"],
             last_name=user_json["last_name"],
             email=user_json["email"],
         )
-        user.set_password(user_json["password"])
+        await user.set_password(user_json["password"])
         await add_user(self.session, user)
         return web.json_response(user.dict, status=201)
 
@@ -144,6 +187,7 @@ class UserView(web.View):
         await self.session.delete(user)
         await self.session.commit()
         return web.json_response({"status": "deleted"})
+
 
 class AdsView(web.View):
     @property
@@ -202,20 +246,36 @@ class AdsView(web.View):
     async def delete(self):
         ads = await self.get_ads()
         self.check_ownership(ads)
-
         await self.session.delete(ads)
         await self.session.commit()
         return web.json_response({"status": "deleted"})
+
+
+class AdsListView(web.View):
+    @property
+    def session(self) -> AsyncSession:
+        return self.request.session
+
+    async def get(self):
+        query = self.request.query
+        stmt = select(Ads).options(selectinload(Ads.user))
+        result = await self.session.execute(stmt)
+        ads_list = result.scalars().all()
+        ads_data = [ads.to_dict() for ads in ads_list]
+        return web.json_response({
+            'ads': ads_data,
+            'count': len(ads_data)
+        })
 
 app.add_routes(
     [
         web.get(r'/users/{user_id:\d+}', UserView),
         web.delete(r'/users/{user_id:\d+}', UserView),
         web.post(r'/users/', UserView),
-        web.post('/login/', SessionView),
-        web.post('/logout/', SessionView),
+        web.post('/login/', JWTAuthView),
         web.get(r'/ads/{ads_id:\d+}', AdsView),
-        web.post(r'/ads/', AdsView),
+        web.get(r'/ads/', AdsListView),
+        web.post(r'/all_ads/', AdsView),
         web.patch(r'/ads/{ads_id:\d+}', AdsView),
         web.delete(r'/ads/{ads_id:\d+}', AdsView),
     ]
