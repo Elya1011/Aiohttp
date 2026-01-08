@@ -1,10 +1,9 @@
-import datetime
+import datetime, os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import Integer, String, Text, DateTime, func, ForeignKey
 from dotenv import load_dotenv
-from werkzeug.security import generate_password_hash, check_password_hash
-import os
+from security import hash_password, verify_password
 
 load_dotenv()
 
@@ -30,11 +29,11 @@ class User(Base):
         lazy='selectin'
     )
 
-    def set_password(self, password: str):
-        self.password_hash = generate_password_hash(password)
+    async def set_password(self, password: str):
+        self.password_hash = await hash_password(password)
 
-    def check_password(self, password: str) -> bool:
-        return check_password_hash(self.password_hash, password)
+    async def check_password(self, password: str) -> bool:
+        return await verify_password(password, self.password_hash)
 
     @property
     def dict(self):
@@ -73,6 +72,23 @@ class Ads(Base):
             'title': self.title,
             'description': self.description,
             'user_id': self.user_id
+        }
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'title': self.title,
+            'description': self.description,
+            'date': self.date.isoformat() if self.date else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'user_id': self.user_id,
+            'user': {
+                'id': self.user.id,
+                'first_name': self.user.first_name,
+                'last_name': self.user.last_name,
+                'email': self.user.email
+            } if self.user else None,
+            'was_edited': self.was_edited()
         }
 
 async def init_orm():
